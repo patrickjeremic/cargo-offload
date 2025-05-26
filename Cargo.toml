@@ -1,0 +1,13 @@
+[package]
+name = "cargo-offload"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "offload"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
