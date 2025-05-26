@@ -645,13 +645,13 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-fn separate_run_args(args: &[String]) -> (Vec<String>, Vec<String>) {
-    if let Some(pos) = args.iter().position(|arg| arg == "--") {
-        let build_args = args[..pos].to_vec();
-        let run_args = args[pos + 1..].to_vec();
+fn separate_run_args_from_raw(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
+    if let Some(pos) = raw_args.iter().position(|arg| arg == "--") {
+        let build_args = raw_args[..pos].to_vec();
+        let run_args = raw_args[pos + 1..].to_vec();
         (build_args, run_args)
     } else {
-        (args.to_vec(), vec![])
+        (raw_args.to_vec(), vec![])
     }
 }
 
@@ -660,9 +660,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start_time = Instant::now();
 
+    // Get raw command line arguments to preserve "--" separator
+    let raw_args: Vec<String> = std::env::args().collect();
+
     // Parse command line arguments to extract toolchain if specified
-    let args: Vec<String> = std::env::args().collect();
-    let (toolchain, filtered_args) = parse_cargo_style_args(args);
+    let (toolchain, filtered_args) = parse_cargo_style_args(raw_args.clone());
 
     // Re-parse with filtered args (without the +toolchain part)
     let cli = Cli::try_parse_from(filtered_args)?;
@@ -687,8 +689,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Commands::Run { bin, args } => {
-            let (build_args, run_args) = separate_run_args(&args);
+        Commands::Run { bin, args: _ } => {
+            // For run command, we need to parse raw args to handle "--" separator properly
+            // Skip the program name and "run" command, then extract relevant args
+            let mut run_args_start = 1; // Skip program name
+
+            // Skip past global args and the "run" subcommand
+            let mut i = 1;
+            while i < raw_args.len() {
+                let arg = &raw_args[i];
+                if arg == "run" {
+                    run_args_start = i + 1;
+                    break;
+                }
+                // Skip global args with values
+                if arg == "--host" || arg == "--port" || arg == "--target" {
+                    i += 1; // Skip the value too
+                } else if arg.starts_with("--host=")
+                    || arg.starts_with("--port=")
+                    || arg.starts_with("--target=")
+                {
+                    // Single arg with = format, no need to skip extra
+                }
+                i += 1;
+            }
+
+            // Handle --bin argument if present
+            while run_args_start < raw_args.len() && raw_args[run_args_start] == "--bin" {
+                run_args_start += 2; // Skip --bin and its value
+            }
+
+            let run_raw_args = &raw_args[run_args_start..];
+            let (build_args, run_args) = separate_run_args_from_raw(run_raw_args);
 
             offload.sync_source()?;
             offload.setup_toolchain()?;
