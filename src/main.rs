@@ -47,6 +47,10 @@ enum Commands {
         #[arg(long)]
         bin: Option<String>,
 
+        /// Example name to run
+        #[arg(long)]
+        example: Option<String>,
+
         /// All arguments to pass to cargo build and the binary
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
@@ -82,6 +86,8 @@ struct CargoToml {
     package: Option<Package>,
     workspace: Option<Workspace>,
     bin: Option<Vec<BinaryTarget>>,
+    example: Option<Vec<BinaryTarget>>,
+    lib: Option<LibTarget>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +107,13 @@ struct BinaryTarget {
 }
 
 #[derive(Deserialize)]
+struct LibTarget {
+    name: Option<String>,
+    #[serde(rename = "crate-type")]
+    crate_type: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
 struct RustToolchainToml {
     toolchain: Option<ToolchainConfig>,
 }
@@ -108,6 +121,13 @@ struct RustToolchainToml {
 #[derive(Deserialize)]
 struct ToolchainConfig {
     channel: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactType {
+    Binary(String),
+    Example(String),
+    Library(String, String), // (name, extension)
 }
 
 struct CargoOffload {
@@ -249,6 +269,22 @@ impl CargoOffload {
                 self.remote_dir, toolchain
             ))?;
         }
+
+        // Always ensure the target is installed
+        info!("Ensuring target {} is installed on remote...", self.target);
+        let target_install_cmd = if let Some(toolchain) = &self.toolchain {
+            format!(
+                "cd {} && rustup target add {} --toolchain {}",
+                self.remote_dir, self.target, toolchain
+            )
+        } else {
+            format!(
+                "cd {} && rustup target add {}",
+                self.remote_dir, self.target
+            )
+        };
+
+        self.run_ssh_command_silent(&target_install_cmd)?;
         Ok(())
     }
 
@@ -315,10 +351,11 @@ impl CargoOffload {
         Ok(())
     }
 
-    fn copy_binaries(
+    fn copy_artifacts(
         &self,
         args: &[String],
         specific_bin: Option<&String>,
+        specific_example: Option<&String>,
     ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
         let release = args.contains(&"--release".to_string());
         let profile = if release { "release" } else { "debug" };
@@ -328,30 +365,57 @@ impl CargoOffload {
         let local_target_dir = format!("target/offload/{}/{}", self.target, profile);
         fs::create_dir_all(&local_target_dir)?;
 
-        // Get list of binaries to copy
-        let binaries = if let Some(bin_name) = specific_bin {
+        // Create examples subdirectory for examples
+        let local_examples_dir = format!("{}/examples", local_target_dir);
+        fs::create_dir_all(&local_examples_dir)?;
+
+        // Get list of artifacts to copy
+        let artifacts = if let Some(example_name) = specific_example {
+            // If specific example requested, only copy that one
+            vec![ArtifactType::Example(example_name.clone())]
+        } else if let Some(bin_name) = specific_bin {
             // If specific binary requested, only copy that one
-            vec![bin_name.clone()]
+            vec![ArtifactType::Binary(bin_name.clone())]
         } else {
-            // Otherwise get all binaries from the project/workspace
-            self.get_binary_names()?
+            // Otherwise get all artifacts from the project/workspace
+            self.get_all_artifacts()?
         };
 
-        let mut copied_binaries = Vec::new();
+        let mut copied_artifacts = Vec::new();
 
         // Run copy operations in parallel
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
 
-        for binary_name in binaries {
-            let remote_binary = format!("{}/{}", remote_target_dir, binary_name);
-            let local_binary = format!("{}/{}", local_target_dir, binary_name);
+        for artifact in artifacts {
+            let remote_target_dir = remote_target_dir.clone();
+            let local_target_dir = local_target_dir.clone();
+            let local_examples_dir = local_examples_dir.clone();
             let host = self.host.clone();
             let port = self.port;
             let tx = tx.clone();
 
             let handle = thread::spawn(move || {
-                info!("Copying binary: {} -> {}", binary_name, local_binary);
+                let (remote_path, local_path, artifact_name) = match &artifact {
+                    ArtifactType::Binary(name) => {
+                        let remote = format!("{}/{}", remote_target_dir, name);
+                        let local = format!("{}/{}", local_target_dir, name);
+                        (remote, local, name.clone())
+                    }
+                    ArtifactType::Example(name) => {
+                        let remote = format!("{}/examples/{}", remote_target_dir, name);
+                        let local = format!("{}/{}", local_examples_dir, name);
+                        (remote, local, format!("example:{}", name))
+                    }
+                    ArtifactType::Library(name, ext) => {
+                        let filename = format!("{}.{}", name, ext);
+                        let remote = format!("{}/{}", remote_target_dir, filename);
+                        let local = format!("{}/{}", local_target_dir, filename);
+                        (remote, local, format!("lib:{}", filename))
+                    }
+                };
+
+                info!("Copying artifact: {} -> {}", artifact_name, local_path);
 
                 let mut rsync_cmd = Command::new("rsync");
                 rsync_cmd
@@ -361,38 +425,47 @@ impl CargoOffload {
                     .arg("-e")
                     .arg(format!("ssh -p {}", port))
                     .arg(PROGRESS_FLAG)
-                    .arg(format!("{}:{}", host, remote_binary))
-                    .arg(&local_binary)
+                    .arg(format!("{}:{}", host, remote_path))
+                    .arg(&local_path)
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit());
 
                 let output = rsync_cmd.output();
                 let result = match output {
                     Ok(output) if output.status.success() => {
-                        // Make binary executable
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = fs::metadata(&local_binary) {
-                                let mut perms = metadata.permissions();
-                                perms.set_mode(0o755);
-                                let _ = fs::set_permissions(&local_binary, perms);
+                        // Make binary/example executable
+                        if matches!(artifact, ArtifactType::Binary(_) | ArtifactType::Example(_)) {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if let Ok(metadata) = fs::metadata(&local_path) {
+                                    let mut perms = metadata.permissions();
+                                    perms.set_mode(0o755);
+                                    let _ = fs::set_permissions(&local_path, perms);
+                                }
                             }
                         }
-                        Ok(PathBuf::from(local_binary))
+                        Ok(PathBuf::from(local_path))
                     }
-                    Ok(output) => Err(format!(
-                        "Failed to copy {}: {}",
-                        binary_name,
-                        String::from_utf8_lossy(&output.stderr)
-                    )),
+                    Ok(output) => {
+                        // Don't error on library artifacts that might not exist
+                        if matches!(artifact, ArtifactType::Library(_, _)) {
+                            warn!("Library artifact {} not found (this is normal if crate-type is not configured)", artifact_name);
+                            return;
+                        }
+                        Err(format!(
+                            "Failed to copy {}: {}",
+                            artifact_name,
+                            String::from_utf8_lossy(&output.stderr)
+                        ))
+                    }
                     Err(e) => Err(format!(
                         "Failed to execute rsync for {}: {}",
-                        binary_name, e
+                        artifact_name, e
                     )),
                 };
 
-                tx.send((binary_name, result)).unwrap();
+                tx.send((artifact_name, result)).unwrap();
             });
 
             handles.push(handle);
@@ -401,25 +474,25 @@ impl CargoOffload {
         // Close the sender to signal completion
         drop(tx);
 
-        // Wait for all threads to complete and collect results
+        // Wait for all threads to complete
         for handle in handles {
             handle.join().unwrap();
         }
 
         // Collect results
-        for (_binary_name, result) in rx {
+        for (_artifact_name, result) in rx {
             match result {
-                Ok(path) => copied_binaries.push(path),
+                Ok(path) => copied_artifacts.push(path),
                 Err(e) => warn!("{}", e),
             }
         }
 
-        if copied_binaries.is_empty() {
-            return Err("No binaries were successfully copied".into());
+        if copied_artifacts.is_empty() {
+            return Err("No artifacts were successfully copied".into());
         }
 
-        info!("Successfully copied {} binaries", copied_binaries.len());
-        Ok(copied_binaries)
+        info!("Successfully copied {} artifacts", copied_artifacts.len());
+        Ok(copied_artifacts)
     }
 
     fn clean(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -439,23 +512,23 @@ impl CargoOffload {
         Ok(())
     }
 
-    fn get_binary_names(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let mut binaries = Vec::new();
+    fn get_all_artifacts(&self) -> Result<Vec<ArtifactType>, Box<dyn std::error::Error>> {
+        let mut artifacts = Vec::new();
 
         if self.is_workspace {
-            // For workspaces, we need to discover all binaries across all members
-            self.collect_workspace_binaries(&mut binaries)?;
+            // For workspaces, we need to discover all artifacts across all members
+            self.collect_workspace_artifacts(&mut artifacts)?;
         } else {
             // For regular projects, just check the root Cargo.toml
-            self.collect_project_binaries("Cargo.toml", &mut binaries)?;
+            self.collect_project_artifacts("Cargo.toml", &mut artifacts)?;
         }
 
-        Ok(binaries)
+        Ok(artifacts)
     }
 
-    fn collect_workspace_binaries(
+    fn collect_workspace_artifacts(
         &self,
-        binaries: &mut Vec<String>,
+        artifacts: &mut Vec<ArtifactType>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cargo_toml = fs::read_to_string("Cargo.toml")?;
         let parsed: CargoToml = toml::from_str(&cargo_toml)?;
@@ -465,11 +538,11 @@ impl CargoOffload {
                 for member in members {
                     // Handle glob patterns in member paths
                     if member.contains('*') {
-                        self.collect_glob_binaries(&member, binaries)?;
+                        self.collect_glob_artifacts(&member, artifacts)?;
                     } else {
                         let member_cargo_toml = format!("{}/Cargo.toml", member);
                         if Path::new(&member_cargo_toml).exists() {
-                            self.collect_project_binaries(&member_cargo_toml, binaries)?;
+                            self.collect_project_artifacts(&member_cargo_toml, artifacts)?;
                         }
                     }
                 }
@@ -479,10 +552,10 @@ impl CargoOffload {
         Ok(())
     }
 
-    fn collect_glob_binaries(
+    fn collect_glob_artifacts(
         &self,
         pattern: &str,
-        binaries: &mut Vec<String>,
+        artifacts: &mut Vec<ArtifactType>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Simple glob handling for patterns like "crates/*"
         let base_path = pattern.trim_end_matches("/*").trim_end_matches('*');
@@ -492,9 +565,9 @@ impl CargoOffload {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let cargo_toml_path = entry.path().join("Cargo.toml");
                     if cargo_toml_path.exists() {
-                        self.collect_project_binaries(
+                        self.collect_project_artifacts(
                             &cargo_toml_path.to_string_lossy(),
-                            binaries,
+                            artifacts,
                         )?;
                     }
                 }
@@ -504,10 +577,10 @@ impl CargoOffload {
         Ok(())
     }
 
-    fn collect_project_binaries(
+    fn collect_project_artifacts(
         &self,
         cargo_toml_path: &str,
-        binaries: &mut Vec<String>,
+        artifacts: &mut Vec<ArtifactType>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cargo_toml = fs::read_to_string(cargo_toml_path)?;
         let parsed: CargoToml = toml::from_str(&cargo_toml)?;
@@ -520,15 +593,25 @@ impl CargoOffload {
         // Check if main binary exists (src/main.rs or specified path)
         if let Some(ref package) = parsed.package {
             let main_rs_path = base_path.join("src/main.rs");
-            if main_rs_path.exists() && !binaries.contains(&package.name) {
-                binaries.push(package.name.clone());
+            if main_rs_path.exists() {
+                let binary_name = package.name.clone();
+                if !artifacts
+                    .iter()
+                    .any(|a| matches!(a, ArtifactType::Binary(name) if name == &binary_name))
+                {
+                    artifacts.push(ArtifactType::Binary(binary_name));
+                }
             }
         }
 
         // Add additional binaries defined in [[bin]] sections
         if let Some(bin_targets) = parsed.bin {
             for bin in bin_targets {
-                if !binaries.contains(&bin.name) {
+                let binary_name = bin.name.clone();
+                if !artifacts
+                    .iter()
+                    .any(|a| matches!(a, ArtifactType::Binary(name) if name == &binary_name))
+                {
                     let bin_path = if let Some(ref path) = bin.path {
                         base_path.join(path)
                     } else {
@@ -537,7 +620,7 @@ impl CargoOffload {
 
                     // Only include if the binary source file exists
                     if bin_path.exists() {
-                        binaries.push(bin.name);
+                        artifacts.push(ArtifactType::Binary(binary_name));
                     }
                 }
             }
@@ -551,9 +634,89 @@ impl CargoOffload {
                     if let Some(file_name) = entry.file_name().to_str() {
                         if file_name.ends_with(".rs") {
                             let bin_name = file_name.trim_end_matches(".rs").to_string();
-                            if !binaries.contains(&bin_name) {
-                                binaries.push(bin_name);
+                            if !artifacts.iter().any(
+                                |a| matches!(a, ArtifactType::Binary(name) if name == &bin_name),
+                            ) {
+                                artifacts.push(ArtifactType::Binary(bin_name));
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add examples defined in [[example]] sections
+        if let Some(example_targets) = parsed.example {
+            for example in example_targets {
+                let example_name = example.name.clone();
+                if !artifacts
+                    .iter()
+                    .any(|a| matches!(a, ArtifactType::Example(name) if name == &example_name))
+                {
+                    let example_path = if let Some(ref path) = example.path {
+                        base_path.join(path)
+                    } else {
+                        base_path.join(format!("examples/{}.rs", example.name))
+                    };
+
+                    // Only include if the example source file exists
+                    if example_path.exists() {
+                        artifacts.push(ArtifactType::Example(example_name));
+                    }
+                }
+            }
+        }
+
+        // Check for additional examples in examples/ directory
+        let examples_dir = base_path.join("examples");
+        if examples_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&examples_dir) {
+                for entry in entries.flatten() {
+                    if let Some(file_name) = entry.file_name().to_str() {
+                        if file_name.ends_with(".rs") {
+                            let example_name = file_name.trim_end_matches(".rs").to_string();
+                            if !artifacts.iter().any(|a| matches!(a, ArtifactType::Example(name) if name == &example_name)) {
+                                artifacts.push(ArtifactType::Example(example_name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add library artifacts (cdylib, staticlib)
+        if let Some(ref lib) = parsed.lib {
+            if let Some(ref crate_types) = lib.crate_type {
+                let lib_name = lib
+                    .name
+                    .as_ref()
+                    .or(parsed.package.as_ref().map(|p| &p.name));
+                if let Some(lib_name) = lib_name {
+                    for crate_type in crate_types {
+                        let (prefix, extension) = match crate_type.as_str() {
+                            "cdylib" => {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    ("", "dll")
+                                }
+                                #[cfg(target_os = "macos")]
+                                {
+                                    ("lib", "dylib")
+                                }
+                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                                {
+                                    ("lib", "so")
+                                }
+                            }
+                            "staticlib" => ("lib", "a"),
+                            _ => continue, // Skip other crate types
+                        };
+
+                        let full_name = format!("{}{}", prefix, lib_name);
+                        if !artifacts.iter().any(
+                            |a| matches!(a, ArtifactType::Library(name, _) if name == &full_name),
+                        ) {
+                            artifacts.push(ArtifactType::Library(full_name, extension.to_string()));
                         }
                     }
                 }
@@ -681,15 +844,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             offload.sync_source()?;
             offload.setup_toolchain()?;
             offload.run_cargo_command("build", &args)?;
-            offload.copy_binaries(&args, None)?;
+            offload.copy_artifacts(&args, None, None)?;
             let elapsed = start_time.elapsed();
             info!(
-                "Build completed and binaries copied successfully (took {})",
+                "Build completed and artifacts copied successfully (took {})",
                 format_duration(elapsed)
             );
         }
 
-        Commands::Run { bin, args: _ } => {
+        Commands::Run {
+            bin,
+            example,
+            args: _,
+        } => {
             // For run command, we need to parse raw args to handle "--" separator properly
             // Skip the program name and "run" command, then extract relevant args
             let mut run_args_start = 1; // Skip program name
@@ -714,9 +881,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
             }
 
-            // Handle --bin argument if present
-            while run_args_start < raw_args.len() && raw_args[run_args_start] == "--bin" {
-                run_args_start += 2; // Skip --bin and its value
+            // Handle --bin and --example arguments if present
+            while run_args_start < raw_args.len() {
+                let arg = &raw_args[run_args_start];
+                if arg == "--bin" || arg == "--example" {
+                    run_args_start += 2; // Skip flag and its value
+                } else {
+                    break;
+                }
             }
 
             let run_raw_args = &raw_args[run_args_start..];
@@ -725,30 +897,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             offload.sync_source()?;
             offload.setup_toolchain()?;
 
-            // Add --bin flag to build args if specified
+            // Add --bin or --example flag to build args if specified
             let mut final_build_args = build_args;
             if let Some(ref bin_name) = bin {
                 final_build_args.push("--bin".to_string());
                 final_build_args.push(bin_name.clone());
+            } else if let Some(ref example_name) = example {
+                final_build_args.push("--example".to_string());
+                final_build_args.push(example_name.clone());
             }
 
             offload.run_cargo_command("build", &final_build_args)?;
-            let binaries = offload.copy_binaries(&final_build_args, bin.as_ref())?;
+            let artifacts =
+                offload.copy_artifacts(&final_build_args, bin.as_ref(), example.as_ref())?;
 
-            let binary_to_run = if let Some(bin_name) = &bin {
-                binaries
+            let artifact_to_run = if let Some(example_name) = &example {
+                artifacts
+                    .into_iter()
+                    .find(|p| {
+                        p.parent()
+                            .and_then(|parent| parent.file_name())
+                            .map(|name| name == "examples")
+                            .unwrap_or(false)
+                            && p.file_name().unwrap().to_string_lossy() == *example_name
+                    })
+                    .ok_or_else(|| format!("Example '{}' not found", example_name))?
+            } else if let Some(bin_name) = &bin {
+                artifacts
                     .into_iter()
                     .find(|p| p.file_name().unwrap().to_string_lossy() == *bin_name)
                     .ok_or_else(|| format!("Binary '{}' not found", bin_name))?
-            } else if binaries.len() == 1 {
-                binaries.into_iter().next().unwrap()
             } else {
-                return Err(
-                    "Multiple binaries found. Use --bin to specify which one to run".into(),
-                );
+                // Find the first binary (not example or library)
+                let binaries: Vec<_> = artifacts
+                    .into_iter()
+                    .filter(|p| {
+                        !p.parent()
+                            .and_then(|parent| parent.file_name())
+                            .map(|name| name == "examples")
+                            .unwrap_or(false)
+                            && !p.file_name().unwrap().to_string_lossy().starts_with("lib")
+                    })
+                    .collect();
+
+                if binaries.len() == 1 {
+                    binaries.into_iter().next().unwrap()
+                } else if binaries.is_empty() {
+                    return Err("No binaries found to run".into());
+                } else {
+                    return Err(
+                        "Multiple binaries found. Use --bin to specify which one to run".into(),
+                    );
+                }
             };
 
-            offload.run_binary(&binary_to_run, &run_args)?;
+            offload.run_binary(&artifact_to_run, &run_args)?;
             let elapsed = start_time.elapsed();
             info!(
                 "Run completed successfully (took {})",
