@@ -30,6 +30,10 @@ struct Cli {
     /// Target triple (defaults to x86_64-unknown-linux-gnu)
     #[arg(long, global = true)]
     target: Option<String>,
+
+    /// Environment variables to pass to the remote cargo command (e.g. CC=gcc-13)
+    #[arg(short = 'e', long = "env", global = true)]
+    env_vars: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -292,6 +296,7 @@ impl CargoOffload {
         &self,
         subcommand: &str,
         args: &[String],
+        env_vars: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Running cargo {} on remote...", subcommand);
 
@@ -333,7 +338,41 @@ impl CargoOffload {
         // Add user arguments
         cargo_args.extend(final_args);
 
-        let cargo_cmd = format!("cd {} && cargo {}", self.remote_dir, cargo_args.join(" "));
+        // Construct the command with environment variables
+        let env_vars_str = if !env_vars.is_empty() {
+            // Properly quote environment variables to handle spaces in values
+            let quoted_env_vars: Vec<String> = env_vars
+                .iter()
+                .map(|var| {
+                    // Split at the first equals sign
+                    if let Some(pos) = var.find('=') {
+                        let (name, value) = var.split_at(pos + 1);
+                        // Quote the value part if it contains spaces or special characters
+                        if value.contains(' ') || value.contains('"') || value.contains('\'') || 
+                           value.contains('$') || value.contains('&') || value.contains('|') {
+                            // Use single quotes for values with spaces, escaping any single quotes in the value
+                            let escaped_value = value.replace('\'', "'\\''");
+                            format!("{}'{}'", name, escaped_value)
+                        } else {
+                            var.clone()
+                        }
+                    } else {
+                        // If there's no equals sign, just use as is
+                        var.clone()
+                    }
+                })
+                .collect();
+            format!("{} ", quoted_env_vars.join(" "))
+        } else {
+            String::new()
+        };
+
+        let cargo_cmd = format!(
+            "cd {} && {}cargo {}",
+            self.remote_dir,
+            env_vars_str,
+            cargo_args.join(" ")
+        );
 
         self.run_ssh_command(&cargo_cmd)?;
         debug!("Cargo {} completed successfully on remote", subcommand);
@@ -843,7 +882,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Build { args } => {
             offload.sync_source()?;
             offload.setup_toolchain()?;
-            offload.run_cargo_command("build", &args)?;
+            offload.run_cargo_command("build", &args, &cli.env_vars)?;
             offload.copy_artifacts(&args, None, None)?;
             let elapsed = start_time.elapsed();
             info!(
@@ -907,7 +946,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 final_build_args.push(example_name.clone());
             }
 
-            offload.run_cargo_command("build", &final_build_args)?;
+            offload.run_cargo_command("build", &final_build_args, &cli.env_vars)?;
             let artifacts =
                 offload.copy_artifacts(&final_build_args, bin.as_ref(), example.as_ref())?;
 
@@ -962,7 +1001,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Test { args } => {
             offload.sync_source()?;
             offload.setup_toolchain()?;
-            offload.run_cargo_command("test", &args)?;
+            offload.run_cargo_command("test", &args, &cli.env_vars)?;
             let elapsed = start_time.elapsed();
             info!(
                 "Tests completed successfully (took {})",
@@ -973,7 +1012,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Clippy { args } => {
             offload.sync_source()?;
             offload.setup_toolchain()?;
-            offload.run_cargo_command("clippy", &args)?;
+            offload.run_cargo_command("clippy", &args, &cli.env_vars)?;
             let elapsed = start_time.elapsed();
             info!(
                 "Clippy completed successfully (took {})",

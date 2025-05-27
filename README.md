@@ -134,6 +134,7 @@ All commands support these global options:
 - `--host, -h <HOST>`: SSH host (user@hostname or hostname)
 - `--port, -p <PORT>`: SSH port (default: 22)
 - `--target <TARGET>`: Target triple (default: x86_64-unknown-linux-gnu)
+- `--env, -e <ENV>`: Environment variables to pass to remote cargo commands (can be specified multiple times)
 
 ### Examples
 
@@ -150,6 +151,33 @@ offload run --bin server -- --port 8080 --config production.toml
 # Test with specific host from environment
 CARGO_OFFLOAD_HOST=developer@ci-server.com offload test
 ```
+
+### Environment Variables for Remote Builds
+
+You can pass environment variables to the remote cargo command using the `-e` or `--env` flag:
+
+```bash
+# Specify C compiler for the build
+offload -e CC=gcc-13 -e CXX=g++-13 build
+
+# Set Rust-specific environment variables
+offload -e RUST_BACKTRACE=1 -e RUST_LOG=debug test
+
+# Configure compiler flags 
+offload -e RUSTFLAGS="-C target-cpu=native" build --release
+offload -e CXXFLAGS="-include cstdint" build
+
+# Combine with other options
+offload --host build-server.com -e RUSTFLAGS="-D warnings" clippy
+
+# Use with run command
+offload -e CARGO_TERM_COLOR=always run -- --verbose
+
+# Multiple environment variables with complex values
+offload -e CC=gcc-13 -e CFLAGS="-O3 -march=native" -e RUSTFLAGS="-C target-feature=+avx2" build
+```
+
+These environment variables are only applied to the cargo command on the remote machine and don't affect your local environment. Values containing spaces, quotes, or special characters are properly escaped to ensure they work correctly on the remote system.
 
 ### Toolchain Detection
 
