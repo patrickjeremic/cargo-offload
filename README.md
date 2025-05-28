@@ -135,6 +135,7 @@ All commands support these global options:
 - `--port, -p <PORT>`: SSH port (default: 22)
 - `--target <TARGET>`: Target triple (default: x86_64-unknown-linux-gnu)
 - `--env, -e <ENV>`: Environment variables to pass to remote cargo commands (can be specified multiple times)
+- `--copy-all-artifacts`: Copy all artifacts from target directory (including deps, build, etc.)
 
 ### Examples
 
@@ -151,6 +152,25 @@ offload run --bin server -- --port 8080 --config production.toml
 # Test with specific host from environment
 CARGO_OFFLOAD_HOST=developer@ci-server.com offload test
 ```
+
+### Artifact Copying
+
+By default, `offload` copies only the necessary artifacts from the remote target directory, excluding large build directories:
+
+- Copies the entire `target/{target}/{profile}/` directory structure
+- Excludes `build/`, `deps/`, and `incremental/` subdirectories to minimize transfer size
+- Makes binaries and examples executable automatically
+
+To copy all artifacts including dependencies and build files:
+
+```bash
+offload --copy-all-artifacts build
+```
+
+This is useful when:
+- You need the complete build artifacts for debugging
+- You're working with custom build scripts that generate files in these directories
+- You want to preserve incremental compilation data
 
 ### Environment Variables for Remote Builds
 

@@ -1,11 +1,9 @@
 use clap::{Parser, Subcommand};
-use log::{debug, info, warn};
+use log::{debug, info};
 use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Instant;
 use std::{fs, io};
 
@@ -34,6 +32,10 @@ struct Cli {
     /// Environment variables to pass to the remote cargo command (e.g. CC=gcc-13)
     #[arg(short = 'e', long = "env", global = true)]
     env_vars: Vec<String>,
+
+    /// Copy all artifacts from target directory (including deps, build, etc.)
+    #[arg(long = "copy-all-artifacts", global = true)]
+    copy_all_artifacts: bool,
 }
 
 #[derive(Subcommand)]
@@ -86,38 +88,6 @@ enum Commands {
 }
 
 #[derive(Deserialize)]
-struct CargoToml {
-    package: Option<Package>,
-    workspace: Option<Workspace>,
-    bin: Option<Vec<BinaryTarget>>,
-    example: Option<Vec<BinaryTarget>>,
-    lib: Option<LibTarget>,
-}
-
-#[derive(Deserialize)]
-struct Package {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct Workspace {
-    members: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-struct BinaryTarget {
-    name: String,
-    path: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct LibTarget {
-    name: Option<String>,
-    #[serde(rename = "crate-type")]
-    crate_type: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
 struct RustToolchainToml {
     toolchain: Option<ToolchainConfig>,
 }
@@ -127,30 +97,17 @@ struct ToolchainConfig {
     channel: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-enum ArtifactType {
-    Binary(String),
-    Example(String),
-    Library(String, String), // (name, extension)
-}
-
 struct CargoOffload {
     host: String,
     port: u16,
     remote_dir: String,
     toolchain: Option<String>,
     target: String,
-    is_workspace: bool,
+    copy_all_artifacts: bool,
 }
 
 impl CargoOffload {
     fn new(cli: &Cli, toolchain: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
-        let cargo_toml = fs::read_to_string("Cargo.toml")?;
-        let parsed: CargoToml = toml::from_str(&cargo_toml)?;
-
-        // Check if this is a workspace
-        let is_workspace = parsed.workspace.is_some();
-
         // Parse host and port from environment variable or CLI args
         let (host, port) = Self::parse_host_and_port(cli)?;
         info!("Executing command on {}:{}", host, port);
@@ -179,7 +136,7 @@ impl CargoOffload {
             remote_dir,
             toolchain: final_toolchain,
             target,
-            is_workspace,
+            copy_all_artifacts: cli.copy_all_artifacts,
         })
     }
 
@@ -348,8 +305,13 @@ impl CargoOffload {
                     if let Some(pos) = var.find('=') {
                         let (name, value) = var.split_at(pos + 1);
                         // Quote the value part if it contains spaces or special characters
-                        if value.contains(' ') || value.contains('"') || value.contains('\'') || 
-                           value.contains('$') || value.contains('&') || value.contains('|') {
+                        if value.contains(' ')
+                            || value.contains('"')
+                            || value.contains('\'')
+                            || value.contains('$')
+                            || value.contains('&')
+                            || value.contains('|')
+                        {
                             // Use single quotes for values with spaces, escaping any single quotes in the value
                             let escaped_value = value.replace('\'', "'\\''");
                             format!("{}'{}'", name, escaped_value)
@@ -398,140 +360,150 @@ impl CargoOffload {
     ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
         let release = args.contains(&"--release".to_string());
         let profile = if release { "release" } else { "debug" };
-        let remote_target_dir = format!("{}/target/{}/{}", self.remote_dir, self.target, profile);
+        let remote_target_dir = format!("{}/target/{}", self.remote_dir, self.target);
+        let remote_profile_dir = format!("{}/{}", remote_target_dir, profile);
 
         // Create local target directory structure in target/offload/{target_triple}/
-        let local_target_dir = format!("target/offload/{}/{}", self.target, profile);
-        fs::create_dir_all(&local_target_dir)?;
+        let local_target_dir = format!("target/offload/{}", self.target);
+        let local_profile_dir = format!("{}/{}", local_target_dir, profile);
+        fs::create_dir_all(&local_profile_dir)?;
 
-        // Create examples subdirectory for examples
-        let local_examples_dir = format!("{}/examples", local_target_dir);
-        fs::create_dir_all(&local_examples_dir)?;
+        info!("Copying artifacts from remote target directory...");
 
-        // Get list of artifacts to copy
-        let artifacts = if let Some(example_name) = specific_example {
-            // If specific example requested, only copy that one
-            vec![ArtifactType::Example(example_name.clone())]
-        } else if let Some(bin_name) = specific_bin {
-            // If specific binary requested, only copy that one
-            vec![ArtifactType::Binary(bin_name.clone())]
-        } else {
-            // Otherwise get all artifacts from the project/workspace
-            self.get_all_artifacts()?
-        };
+        // Use a single rsync call to copy the entire target directory
+        let mut rsync_cmd = Command::new("rsync");
+        rsync_cmd
+            .arg("-a")
+            .arg("--delete")
+            .arg("--compress")
+            .arg("-e")
+            .arg(format!("ssh -p {}", self.port))
+            .arg(PROGRESS_FLAG);
 
-        let mut copied_artifacts = Vec::new();
+        // Add exclusions for large build artifacts unless --copy-all-artifacts is specified
+        if !self.copy_all_artifacts {
+            rsync_cmd
+                .arg("--exclude=build/")
+                .arg("--exclude=deps/")
+                .arg("--exclude=incremental/");
+        }
 
-        // Run copy operations in parallel
-        let (tx, rx) = mpsc::channel();
-        let mut handles = Vec::new();
+        // Set source and destination
+        rsync_cmd
+            .arg(format!("{}:{}/", self.host, remote_profile_dir))
+            .arg(format!("{}/", local_profile_dir))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
 
-        for artifact in artifacts {
-            let remote_target_dir = remote_target_dir.clone();
-            let local_target_dir = local_target_dir.clone();
-            let local_examples_dir = local_examples_dir.clone();
-            let host = self.host.clone();
-            let port = self.port;
-            let tx = tx.clone();
+        let output = rsync_cmd.output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to copy artifacts: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
 
-            let handle = thread::spawn(move || {
-                let (remote_path, local_path, artifact_name) = match &artifact {
-                    ArtifactType::Binary(name) => {
-                        let remote = format!("{}/{}", remote_target_dir, name);
-                        let local = format!("{}/{}", local_target_dir, name);
-                        (remote, local, name.clone())
+        // Make binaries and examples executable on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Find and make executable all binary files in the target directory
+            let make_executable = |path: &Path| {
+                if let Ok(metadata) = fs::metadata(path) {
+                    // Only make executable if it's a file and not a directory
+                    if metadata.is_file() {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = fs::set_permissions(path, perms);
                     }
-                    ArtifactType::Example(name) => {
-                        let remote = format!("{}/examples/{}", remote_target_dir, name);
-                        let local = format!("{}/{}", local_examples_dir, name);
-                        (remote, local, format!("example:{}", name))
+                }
+            };
+
+            // Make binaries in root directory executable
+            if let Ok(entries) = fs::read_dir(&local_profile_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_file() {
+                            make_executable(&entry.path());
+                        }
                     }
-                    ArtifactType::Library(name, ext) => {
-                        let filename = format!("{}.{}", name, ext);
-                        let remote = format!("{}/{}", remote_target_dir, filename);
-                        let local = format!("{}/{}", local_target_dir, filename);
-                        (remote, local, format!("lib:{}", filename))
-                    }
-                };
+                }
+            }
 
-                info!("Copying artifact: {} -> {}", artifact_name, local_path);
-
-                let mut rsync_cmd = Command::new("rsync");
-                rsync_cmd
-                    .arg("-a")
-                    .arg("--delete")
-                    .arg("--compress")
-                    .arg("-e")
-                    .arg(format!("ssh -p {}", port))
-                    .arg(PROGRESS_FLAG)
-                    .arg(format!("{}:{}", host, remote_path))
-                    .arg(&local_path)
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
-
-                let output = rsync_cmd.output();
-                let result = match output {
-                    Ok(output) if output.status.success() => {
-                        // Make binary/example executable
-                        if matches!(artifact, ArtifactType::Binary(_) | ArtifactType::Example(_)) {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                if let Ok(metadata) = fs::metadata(&local_path) {
-                                    let mut perms = metadata.permissions();
-                                    perms.set_mode(0o755);
-                                    let _ = fs::set_permissions(&local_path, perms);
-                                }
+            // Make examples executable
+            let examples_dir = format!("{}/examples", local_profile_dir);
+            if Path::new(&examples_dir).exists() {
+                if let Ok(entries) = fs::read_dir(&examples_dir) {
+                    for entry in entries.flatten() {
+                        if let Ok(file_type) = entry.file_type() {
+                            if file_type.is_file() {
+                                make_executable(&entry.path());
                             }
                         }
-                        Ok(PathBuf::from(local_path))
                     }
-                    Ok(output) => {
-                        // Don't error on library artifacts that might not exist
-                        if matches!(artifact, ArtifactType::Library(_, _)) {
-                            warn!("Library artifact {} not found (this is normal if crate-type is not configured)", artifact_name);
-                            return;
-                        }
-                        Err(format!(
-                            "Failed to copy {}: {}",
-                            artifact_name,
-                            String::from_utf8_lossy(&output.stderr)
-                        ))
-                    }
-                    Err(e) => Err(format!(
-                        "Failed to execute rsync for {}: {}",
-                        artifact_name, e
-                    )),
-                };
-
-                tx.send((artifact_name, result)).unwrap();
-            });
-
-            handles.push(handle);
-        }
-
-        // Close the sender to signal completion
-        drop(tx);
-
-        // Wait for all threads to complete
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Collect results
-        for (_artifact_name, result) in rx {
-            match result {
-                Ok(path) => copied_artifacts.push(path),
-                Err(e) => warn!("{}", e),
+                }
             }
         }
 
-        if copied_artifacts.is_empty() {
-            return Err("No artifacts were successfully copied".into());
+        // Determine which binary to return for the run command
+        let mut result_paths = Vec::new();
+
+        if let Some(bin_name) = specific_bin {
+            // If a specific binary was requested
+            let bin_path = PathBuf::from(format!("{}/{}", local_profile_dir, bin_name));
+            if bin_path.exists() {
+                result_paths.push(bin_path);
+            } else {
+                return Err(format!("Binary '{}' not found after copy", bin_name).into());
+            }
+        } else if let Some(example_name) = specific_example {
+            // If a specific example was requested
+            let example_path =
+                PathBuf::from(format!("{}/examples/{}", local_profile_dir, example_name));
+            if example_path.exists() {
+                result_paths.push(example_path);
+            } else {
+                return Err(format!("Example '{}' not found after copy", example_name).into());
+            }
+        } else {
+            // For general build, just return success without specific paths
+            // Find all executables in the root directory (not in subdirectories)
+            if let Ok(entries) = fs::read_dir(&local_profile_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_file() {
+                            let path = entry.path();
+                            // Skip files that start with "lib" as they're likely libraries
+                            if let Some(file_name) = path.file_name() {
+                                let name = file_name.to_string_lossy();
+                                if !name.starts_with("lib") {
+                                    result_paths.push(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also check examples directory
+            let examples_dir = format!("{}/examples", local_profile_dir);
+            if Path::new(&examples_dir).exists() {
+                if let Ok(entries) = fs::read_dir(&examples_dir) {
+                    for entry in entries.flatten() {
+                        if let Ok(file_type) = entry.file_type() {
+                            if file_type.is_file() {
+                                result_paths.push(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        info!("Successfully copied {} artifacts", copied_artifacts.len());
-        Ok(copied_artifacts)
+        info!("Successfully copied artifacts from remote target directory");
+        Ok(result_paths)
     }
 
     fn clean(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -551,219 +523,7 @@ impl CargoOffload {
         Ok(())
     }
 
-    fn get_all_artifacts(&self) -> Result<Vec<ArtifactType>, Box<dyn std::error::Error>> {
-        let mut artifacts = Vec::new();
-
-        if self.is_workspace {
-            // For workspaces, we need to discover all artifacts across all members
-            self.collect_workspace_artifacts(&mut artifacts)?;
-        } else {
-            // For regular projects, just check the root Cargo.toml
-            self.collect_project_artifacts("Cargo.toml", &mut artifacts)?;
-        }
-
-        Ok(artifacts)
-    }
-
-    fn collect_workspace_artifacts(
-        &self,
-        artifacts: &mut Vec<ArtifactType>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cargo_toml = fs::read_to_string("Cargo.toml")?;
-        let parsed: CargoToml = toml::from_str(&cargo_toml)?;
-
-        if let Some(workspace) = parsed.workspace {
-            if let Some(members) = workspace.members {
-                for member in members {
-                    // Handle glob patterns in member paths
-                    if member.contains('*') {
-                        self.collect_glob_artifacts(&member, artifacts)?;
-                    } else {
-                        let member_cargo_toml = format!("{}/Cargo.toml", member);
-                        if Path::new(&member_cargo_toml).exists() {
-                            self.collect_project_artifacts(&member_cargo_toml, artifacts)?;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn collect_glob_artifacts(
-        &self,
-        pattern: &str,
-        artifacts: &mut Vec<ArtifactType>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Simple glob handling for patterns like "crates/*"
-        let base_path = pattern.trim_end_matches("/*").trim_end_matches('*');
-
-        if let Ok(entries) = fs::read_dir(base_path) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let cargo_toml_path = entry.path().join("Cargo.toml");
-                    if cargo_toml_path.exists() {
-                        self.collect_project_artifacts(
-                            &cargo_toml_path.to_string_lossy(),
-                            artifacts,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn collect_project_artifacts(
-        &self,
-        cargo_toml_path: &str,
-        artifacts: &mut Vec<ArtifactType>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cargo_toml = fs::read_to_string(cargo_toml_path)?;
-        let parsed: CargoToml = toml::from_str(&cargo_toml)?;
-
-        // Determine the base path for this Cargo.toml
-        let base_path = Path::new(cargo_toml_path)
-            .parent()
-            .unwrap_or(Path::new("."));
-
-        // Check if main binary exists (src/main.rs or specified path)
-        if let Some(ref package) = parsed.package {
-            let main_rs_path = base_path.join("src/main.rs");
-            if main_rs_path.exists() {
-                let binary_name = package.name.clone();
-                if !artifacts
-                    .iter()
-                    .any(|a| matches!(a, ArtifactType::Binary(name) if name == &binary_name))
-                {
-                    artifacts.push(ArtifactType::Binary(binary_name));
-                }
-            }
-        }
-
-        // Add additional binaries defined in [[bin]] sections
-        if let Some(bin_targets) = parsed.bin {
-            for bin in bin_targets {
-                let binary_name = bin.name.clone();
-                if !artifacts
-                    .iter()
-                    .any(|a| matches!(a, ArtifactType::Binary(name) if name == &binary_name))
-                {
-                    let bin_path = if let Some(ref path) = bin.path {
-                        base_path.join(path)
-                    } else {
-                        base_path.join(format!("src/bin/{}.rs", bin.name))
-                    };
-
-                    // Only include if the binary source file exists
-                    if bin_path.exists() {
-                        artifacts.push(ArtifactType::Binary(binary_name));
-                    }
-                }
-            }
-        }
-
-        // Check for additional binaries in src/bin/ directory
-        let bin_dir = base_path.join("src/bin");
-        if bin_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&bin_dir) {
-                for entry in entries.flatten() {
-                    if let Some(file_name) = entry.file_name().to_str() {
-                        if file_name.ends_with(".rs") {
-                            let bin_name = file_name.trim_end_matches(".rs").to_string();
-                            if !artifacts.iter().any(
-                                |a| matches!(a, ArtifactType::Binary(name) if name == &bin_name),
-                            ) {
-                                artifacts.push(ArtifactType::Binary(bin_name));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add examples defined in [[example]] sections
-        if let Some(example_targets) = parsed.example {
-            for example in example_targets {
-                let example_name = example.name.clone();
-                if !artifacts
-                    .iter()
-                    .any(|a| matches!(a, ArtifactType::Example(name) if name == &example_name))
-                {
-                    let example_path = if let Some(ref path) = example.path {
-                        base_path.join(path)
-                    } else {
-                        base_path.join(format!("examples/{}.rs", example.name))
-                    };
-
-                    // Only include if the example source file exists
-                    if example_path.exists() {
-                        artifacts.push(ArtifactType::Example(example_name));
-                    }
-                }
-            }
-        }
-
-        // Check for additional examples in examples/ directory
-        let examples_dir = base_path.join("examples");
-        if examples_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&examples_dir) {
-                for entry in entries.flatten() {
-                    if let Some(file_name) = entry.file_name().to_str() {
-                        if file_name.ends_with(".rs") {
-                            let example_name = file_name.trim_end_matches(".rs").to_string();
-                            if !artifacts.iter().any(|a| matches!(a, ArtifactType::Example(name) if name == &example_name)) {
-                                artifacts.push(ArtifactType::Example(example_name));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add library artifacts (cdylib, staticlib)
-        if let Some(ref lib) = parsed.lib {
-            if let Some(ref crate_types) = lib.crate_type {
-                let lib_name = lib
-                    .name
-                    .as_ref()
-                    .or(parsed.package.as_ref().map(|p| &p.name));
-                if let Some(lib_name) = lib_name {
-                    for crate_type in crate_types {
-                        let (prefix, extension) = match crate_type.as_str() {
-                            "cdylib" => {
-                                #[cfg(target_os = "windows")]
-                                {
-                                    ("", "dll")
-                                }
-                                #[cfg(target_os = "macos")]
-                                {
-                                    ("lib", "dylib")
-                                }
-                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                                {
-                                    ("lib", "so")
-                                }
-                            }
-                            "staticlib" => ("lib", "a"),
-                            _ => continue, // Skip other crate types
-                        };
-
-                        let full_name = format!("{}{}", prefix, lib_name);
-                        if !artifacts.iter().any(
-                            |a| matches!(a, ArtifactType::Library(name, _) if name == &full_name),
-                        ) {
-                            artifacts.push(ArtifactType::Library(full_name, extension.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
+    // Removed artifact discovery methods as they're no longer needed
 
     fn run_binary(
         &self,
