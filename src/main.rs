@@ -1,11 +1,13 @@
 use clap::{Parser, Subcommand};
 use log::{debug, info};
-use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::{fs, io};
+
+mod util;
+use util::*;
 
 const PROGRESS_FLAG: &str = "--info=progress2";
 
@@ -43,58 +45,40 @@ enum Commands {
     /// Build the project on remote and copy binaries back
     Build {
         /// All arguments to pass to cargo build
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Build on remote, copy binaries, and run locally
     Run {
-        /// Binary name to run (if multiple binaries exist)
-        #[arg(long)]
-        bin: Option<String>,
-
-        /// Example name to run
-        #[arg(long)]
-        example: Option<String>,
-
-        /// All arguments to pass to cargo build and the binary
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        /// Arguments to pass to cargo build
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Run tests on remote
     Test {
         /// All arguments to pass to cargo test
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Run clippy on remote
     Clippy {
         /// All arguments to pass to cargo clippy
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Execute rustup toolchain commands on remote
     Toolchain {
         /// Arguments to pass to rustup toolchain
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Clean remote build directory and local binaries
     Clean,
-}
-
-#[derive(Deserialize)]
-struct RustToolchainToml {
-    toolchain: Option<ToolchainConfig>,
-}
-
-#[derive(Deserialize)]
-struct ToolchainConfig {
-    channel: Option<String>,
 }
 
 struct CargoOffload {
@@ -128,7 +112,7 @@ impl CargoOffload {
             .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
 
         // Use provided toolchain or detect from files
-        let final_toolchain = toolchain.or_else(|| Self::detect_toolchain().unwrap_or(None));
+        let final_toolchain = toolchain.or_else(|| detect_toolchain().unwrap_or(None));
 
         Ok(CargoOffload {
             host,
@@ -161,30 +145,6 @@ impl CargoOffload {
         // No port in host string, use CLI arg or default
         let port = cli.port.unwrap_or(22);
         Ok((host_str, port))
-    }
-
-    fn detect_toolchain() -> Result<Option<String>, Box<dyn std::error::Error>> {
-        // Try rust-toolchain.toml first
-        if Path::new("rust-toolchain.toml").exists() {
-            let content = fs::read_to_string("rust-toolchain.toml")?;
-            let parsed: RustToolchainToml = toml::from_str(&content)?;
-            if let Some(toolchain) = parsed.toolchain.and_then(|t| t.channel) {
-                debug!("Detected toolchain from rust-toolchain.toml: {}", toolchain);
-                return Ok(Some(toolchain));
-            }
-        }
-
-        // Try rust-toolchain file (plain text format)
-        if Path::new("rust-toolchain").exists() {
-            let content = fs::read_to_string("rust-toolchain")?;
-            let toolchain = content.trim().to_string();
-            if !toolchain.is_empty() {
-                debug!("Detected toolchain from rust-toolchain: {}", toolchain);
-                return Ok(Some(toolchain));
-            }
-        }
-
-        Ok(None)
     }
 
     fn sync_source(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -378,7 +338,9 @@ impl CargoOffload {
             .arg("--compress")
             .arg("-e")
             .arg(format!("ssh -p {}", self.port))
-            .arg(PROGRESS_FLAG);
+            .arg(PROGRESS_FLAG)
+            .arg("--exclude=.cargo-lock")
+            .arg("--exclude=*.d"); // TODO: can we improve this by not excluding?
 
         // Add exclusions for large build artifacts unless --copy-all-artifacts is specified
         if !self.copy_all_artifacts {
@@ -523,8 +485,6 @@ impl CargoOffload {
         Ok(())
     }
 
-    // Removed artifact discovery methods as they're no longer needed
-
     fn run_binary(
         &self,
         binary_path: &Path,
@@ -584,39 +544,6 @@ impl CargoOffload {
     }
 }
 
-fn parse_cargo_style_args(args: Vec<String>) -> (Option<String>, Vec<String>) {
-    if let Some(first_arg) = args.first() {
-        if let Some(toolchain) = first_arg.clone().strip_prefix("+") {
-            let remaining_args = args.into_iter().skip(1).collect();
-            return (Some(toolchain.to_string()), remaining_args);
-        }
-    }
-    (None, args)
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    let total_secs = duration.as_secs();
-    let minutes = total_secs / 60;
-    let seconds = total_secs % 60;
-    let millis = duration.subsec_millis();
-
-    if minutes > 0 {
-        format!("{}m {}.{:03}s", minutes, seconds, millis)
-    } else {
-        format!("{}.{:03}s", seconds, millis)
-    }
-}
-
-fn separate_run_args_from_raw(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
-    if let Some(pos) = raw_args.iter().position(|arg| arg == "--") {
-        let build_args = raw_args[..pos].to_vec();
-        let run_args = raw_args[pos + 1..].to_vec();
-        (build_args, run_args)
-    } else {
-        (raw_args.to_vec(), vec![])
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("warn"));
 
@@ -651,47 +578,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Commands::Run {
-            bin,
-            example,
-            args: _,
-        } => {
-            // For run command, we need to parse raw args to handle "--" separator properly
-            // Skip the program name and "run" command, then extract relevant args
-            let mut run_args_start = 1; // Skip program name
+        Commands::Run { args } => {
+            let (build_args, run_args) = separate_run_args_from_raw(&args);
 
-            // Skip past global args and the "run" subcommand
-            let mut i = 1;
-            while i < raw_args.len() {
-                let arg = &raw_args[i];
-                if arg == "run" {
-                    run_args_start = i + 1;
-                    break;
-                }
-                // Skip global args with values
-                if arg == "--host" || arg == "--port" || arg == "--target" {
-                    i += 1; // Skip the value too
-                } else if arg.starts_with("--host=")
-                    || arg.starts_with("--port=")
-                    || arg.starts_with("--target=")
-                {
-                    // Single arg with = format, no need to skip extra
-                }
-                i += 1;
-            }
-
-            // Handle --bin and --example arguments if present
-            while run_args_start < raw_args.len() {
-                let arg = &raw_args[run_args_start];
-                if arg == "--bin" || arg == "--example" {
-                    run_args_start += 2; // Skip flag and its value
-                } else {
-                    break;
-                }
-            }
-
-            let run_raw_args = &raw_args[run_args_start..];
-            let (build_args, run_args) = separate_run_args_from_raw(run_raw_args);
+            // manually parse args
+            let bin = parse_flag(&build_args, "bin");
+            let example = parse_flag(&build_args, "example");
 
             offload.sync_source()?;
             offload.setup_toolchain()?;
@@ -738,12 +630,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             && !p.file_name().unwrap().to_string_lossy().starts_with("lib")
                     })
                     .collect();
+                debug!(
+                    "found binaries: {}",
+                    binaries
+                        .iter()
+                        .map(|p| p.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
 
                 if binaries.len() == 1 {
                     binaries.into_iter().next().unwrap()
                 } else if binaries.is_empty() {
                     return Err("No binaries found to run".into());
                 } else {
+                    // TODO: determine default binary to run
                     return Err(
                         "Multiple binaries found. Use --bin to specify which one to run".into(),
                     );
