@@ -48,17 +48,38 @@ pub fn parse_flag(args: &[String], arg: &str) -> Option<String> {
     None
 }
 
-#[derive(Deserialize)]
-struct RustToolchainToml {
-    pub toolchain: Option<ToolchainConfig>,
+pub fn detect_toolchain_from_cargo() -> Result<Option<String>> {
+    let output = std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .context("Executing `cargo --version` failed")?;
+
+    if output.status.success() {
+        let stdout =
+            String::from_utf8(output.stdout).context("Invalid `cargo --version` output")?;
+        let stdout = stdout.trim();
+        let splits = stdout.split(" ").collect::<Vec<_>>();
+
+        // cargo 1.87.0 (99624be96 2025-05-06)
+        if splits.len() >= 2 && splits[0] == "cargo" {
+            return Ok(Some(splits[1].to_string()));
+        }
+    }
+
+    Ok(None)
 }
 
-#[derive(Deserialize)]
-struct ToolchainConfig {
-    pub channel: Option<String>,
-}
+pub fn detect_toolchain_from_files() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    #[derive(Deserialize)]
+    struct RustToolchainToml {
+        pub toolchain: Option<ToolchainConfig>,
+    }
 
-pub fn detect_toolchain() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    #[derive(Deserialize)]
+    struct ToolchainConfig {
+        pub channel: Option<String>,
+    }
+
     // Try rust-toolchain.toml first
     if Path::new("rust-toolchain.toml").exists() {
         let content =
@@ -78,27 +99,6 @@ pub fn detect_toolchain() -> Result<Option<String>, Box<dyn std::error::Error>> 
         if !toolchain.is_empty() {
             debug!("Detected toolchain from rust-toolchain: {}", toolchain);
             return Ok(Some(toolchain));
-        }
-    }
-
-    Ok(None)
-}
-
-pub fn detect_toolchain_from_cargo() -> Result<Option<String>> {
-    let output = std::process::Command::new("cargo")
-        .arg("--version")
-        .output()
-        .context("Executing `cargo --version` failed")?;
-
-    if output.status.success() {
-        let stdout =
-            String::from_utf8(output.stdout).context("Invalid `cargo --version` output")?;
-        let stdout = stdout.trim();
-        let splits = stdout.split(" ").collect::<Vec<_>>();
-
-        // cargo 1.87.0 (99624be96 2025-05-06)
-        if splits.len() >= 2 && splits[0] == "cargo" {
-            return Ok(Some(splits[1].to_string()));
         }
     }
 

@@ -111,10 +111,10 @@ impl CargoOffload {
             .clone()
             .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
 
-        // Use provided toolchain, detect from file or try `cargo --version`
+        // Use provided toolchain, detect it from `cargo --version` or use toolchain files
         let final_toolchain = toolchain
-            .or_else(|| detect_toolchain().unwrap_or(None))
-            .or_else(|| detect_toolchain_from_cargo().unwrap_or(None));
+            .or_else(|| detect_toolchain_from_cargo().unwrap_or(None))
+            .or_else(|| detect_toolchain_from_files().unwrap_or(None));
 
         Ok(CargoOffload {
             host,
