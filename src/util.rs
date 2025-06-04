@@ -25,6 +25,10 @@ pub fn separate_run_args_from_raw(raw_args: &[String]) -> (Vec<String>, Vec<Stri
 
 // TODO: should support --long=value syntax as well
 pub fn parse_flag(args: &[String], arg: &str) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+
     for i in 0..(args.len() - 1) {
         if let Some(a) = args[i].strip_prefix("--") {
             if a == arg {
