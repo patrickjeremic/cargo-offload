@@ -5,9 +5,11 @@ use log::debug;
 use serde::Deserialize;
 
 pub fn parse_cargo_style_args(args: Vec<String>) -> (Option<String>, Vec<String>) {
-    if let Some(first_arg) = args.first() {
+    // the first argument is the binary name, so we get the second argument here.
+    if let Some(first_arg) = args.get(1) {
         if let Some(toolchain) = first_arg.clone().strip_prefix("+") {
-            let remaining_args = args.into_iter().skip(1).collect();
+            let mut remaining_args = args.into_iter().collect::<Vec<_>>();
+            remaining_args.remove(1);
             return (Some(toolchain.to_string()), remaining_args);
         }
     }
