@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use anyhow::{Context, Result};
 use log::debug;
 use serde::Deserialize;
 
@@ -31,29 +32,39 @@ pub fn parse_flag(args: &[String], arg: &str) -> Option<String> {
 
     for i in 0..(args.len() - 1) {
         if let Some(a) = args[i].strip_prefix("--") {
-            if a == arg {
+            let s = a.split("=").collect::<Vec<_>>();
+            if s.len() == 2 {
+                // found `--key=value` arg
+                if s[0] == arg {
+                    return Some(s[1].to_string());
+                }
+            } else if a == arg {
+                // found regular `--key value` arg
                 return Some(args[i + 1].clone());
             }
         }
     }
+
     None
 }
 
 #[derive(Deserialize)]
-pub struct RustToolchainToml {
+struct RustToolchainToml {
     pub toolchain: Option<ToolchainConfig>,
 }
 
 #[derive(Deserialize)]
-pub struct ToolchainConfig {
+struct ToolchainConfig {
     pub channel: Option<String>,
 }
 
 pub fn detect_toolchain() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // Try rust-toolchain.toml first
     if Path::new("rust-toolchain.toml").exists() {
-        let content = fs::read_to_string("rust-toolchain.toml")?;
-        let parsed: RustToolchainToml = toml::from_str(&content)?;
+        let content =
+            fs::read_to_string("rust-toolchain.toml").context("Cannot open rust-toolchain.toml")?;
+        let parsed: RustToolchainToml =
+            toml::from_str(&content).context("Cannot parse rust-toolchain.toml")?;
         if let Some(toolchain) = parsed.toolchain.and_then(|t| t.channel) {
             debug!("Detected toolchain from rust-toolchain.toml: {}", toolchain);
             return Ok(Some(toolchain));
@@ -62,11 +73,32 @@ pub fn detect_toolchain() -> Result<Option<String>, Box<dyn std::error::Error>> 
 
     // Try rust-toolchain file (plain text format)
     if Path::new("rust-toolchain").exists() {
-        let content = fs::read_to_string("rust-toolchain")?;
+        let content = fs::read_to_string("rust-toolchain").context("Cannot open rust-toolchain")?;
         let toolchain = content.trim().to_string();
         if !toolchain.is_empty() {
             debug!("Detected toolchain from rust-toolchain: {}", toolchain);
             return Ok(Some(toolchain));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn detect_toolchain_from_cargo() -> Result<Option<String>> {
+    let output = std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .context("Executing `cargo --version` failed")?;
+
+    if output.status.success() {
+        let stdout =
+            String::from_utf8(output.stdout).context("Invalid `cargo --version` output")?;
+        let stdout = stdout.trim();
+        let splits = stdout.split(" ").collect::<Vec<_>>();
+
+        // cargo 1.87.0 (99624be96 2025-05-06)
+        if splits.len() >= 2 && splits[0] == "cargo" {
+            return Ok(Some(splits[1].to_string()));
         }
     }
 

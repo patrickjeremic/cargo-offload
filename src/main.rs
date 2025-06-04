@@ -111,8 +111,10 @@ impl CargoOffload {
             .clone()
             .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
 
-        // Use provided toolchain or detect from files
-        let final_toolchain = toolchain.or_else(|| detect_toolchain().unwrap_or(None));
+        // Use provided toolchain, detect from file or try `cargo --version`
+        let final_toolchain = toolchain
+            .or_else(|| detect_toolchain().unwrap_or(None))
+            .or_else(|| detect_toolchain_from_cargo().unwrap_or(None));
 
         Ok(CargoOffload {
             host,
@@ -183,12 +185,17 @@ impl CargoOffload {
     }
 
     fn setup_toolchain(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(toolchain) = &self.toolchain {
-            info!("Setting up toolchain {} on remote...", toolchain);
-            self.run_ssh_command_silent(&format!(
-                "cd {} && rustup toolchain install {}",
-                self.remote_dir, toolchain
-            ))?;
+        match &self.toolchain {
+            Some(toolchain) => {
+                info!("Setting up toolchain {} on remote...", toolchain);
+                self.run_ssh_command_silent(&format!(
+                    "cd {} && rustup toolchain install {}",
+                    self.remote_dir, toolchain
+                ))?;
+            }
+            None => {
+                // TODO: make sure stable matches?
+            }
         }
 
         // Always ensure the target is installed
