@@ -117,8 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (build_args, run_args) = separate_run_args_from_raw(&args);
 
             // manually parse args
-            let bin = parse_flag(&build_args, "bin");
-            let example = parse_flag(&build_args, "example");
+            let bin = parse_flag(&build_args, "bin")?;
+            let example = parse_flag(&build_args, "example")?;
 
             offload.sync_source()?;
             offload.setup_toolchain()?;

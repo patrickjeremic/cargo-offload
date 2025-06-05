@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::debug;
 use serde::Deserialize;
 
@@ -26,10 +26,9 @@ pub fn separate_run_args_from_raw(raw_args: &[String]) -> (Vec<String>, Vec<Stri
     }
 }
 
-// TODO: should support --long=value syntax as well
-pub fn parse_flag(args: &[String], arg: &str) -> Option<String> {
+pub fn parse_flag(args: &[String], arg: &str) -> Result<Option<String>> {
     if args.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     for i in 0..(args.len() - 1) {
@@ -38,16 +37,21 @@ pub fn parse_flag(args: &[String], arg: &str) -> Option<String> {
             if s.len() == 2 {
                 // found `--key=value` arg
                 if s[0] == arg {
-                    return Some(s[1].to_string());
+                    return Ok(Some(s[1].to_string()));
                 }
             } else if a == arg {
                 // found regular `--key value` arg
-                return Some(args[i + 1].clone());
+                let v = args[i + 1].clone();
+                if v.starts_with("-") {
+                    bail!("Invalid argument `--{a} {v}`");
+                }
+
+                return Ok(Some(v));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 pub fn detect_toolchain_from_cargo() -> Result<Option<String>> {
