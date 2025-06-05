@@ -4,16 +4,16 @@ use anyhow::{Context, Result};
 use log::debug;
 use serde::Deserialize;
 
-pub fn parse_cargo_style_args(args: Vec<String>) -> (Option<String>, Vec<String>) {
-    // the first argument is the binary name, so we get the second argument here.
-    if let Some(first_arg) = args.get(1) {
-        if let Some(toolchain) = first_arg.clone().strip_prefix("+") {
-            let mut remaining_args = args.into_iter().collect::<Vec<_>>();
-            remaining_args.remove(1);
-            return (Some(toolchain.to_string()), remaining_args);
-        }
+pub fn parse_cargo_style_args(raw_args: Vec<String>) -> (Option<String>, Vec<String>) {
+    if let Some(pos) = raw_args.iter().position(|arg| arg.starts_with("+")) {
+        let toolchain = raw_args[pos].trim_start_matches('+');
+        let mut first = raw_args[..pos].to_vec();
+        let last = &raw_args[pos + 1..];
+        first.extend_from_slice(last);
+        (Some(toolchain.to_string()), first)
+    } else {
+        (None, raw_args)
     }
-    (None, args)
 }
 
 pub fn separate_run_args_from_raw(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
