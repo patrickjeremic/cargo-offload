@@ -1,3 +1,4 @@
+use anyhow::Context;
 use log::{debug, info};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -106,7 +107,7 @@ impl CargoOffload {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let output = rsync_cmd.output()?;
+        let output = rsync_cmd.output().context("rsync failed")?;
         if !output.status.success() {
             return Err(
                 format!("rsync failed: {}", String::from_utf8_lossy(&output.stderr)).into(),
@@ -301,7 +302,7 @@ impl CargoOffload {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let output = rsync_cmd.output()?;
+        let output = rsync_cmd.output().context("rsync failed")?;
         if !output.status.success() {
             return Err(format!(
                 "Failed to copy artifacts: {}",
