@@ -36,6 +36,10 @@ pub struct Cli {
     /// Copy all artifacts from target directory (including deps, build, etc.)
     #[arg(long = "copy-all-artifacts", global = true)]
     copy_all_artifacts: bool,
+
+    /// Forward ports from remote to local (format: local_port:remote_port)
+    #[arg(short = 'L', long = "forward", global = true)]
+    forward_ports: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -56,6 +60,14 @@ pub enum Commands {
     #[command(name = "run-local")]
     RunLocal {
         /// Arguments to pass to cargo build
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Run cargo run directly on remote host with optional port forwarding
+    #[command(name = "run-remote")]
+    RunRemote {
+        /// All arguments to pass to cargo run
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -110,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Build { args } => {
             offload.sync_source()?;
             offload.setup_toolchain()?;
-            offload.run_cargo_command("build", &args, &cli.env_vars)?;
+            offload.run_cargo_command("build", &args, &cli.env_vars, &[])?;
             offload.copy_artifacts(&args, None, None)?;
             let elapsed = start_time.elapsed();
             info!(
@@ -139,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 final_build_args.push(example_name.clone());
             }
 
-            offload.run_cargo_command("build", &final_build_args, &cli.env_vars)?;
+            offload.run_cargo_command("build", &final_build_args, &cli.env_vars, &[])?;
             let artifacts =
                 offload.copy_artifacts(&final_build_args, bin.as_ref(), example.as_ref())?;
 
@@ -200,10 +212,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        Commands::RunRemote { args } => {
+            offload.sync_source()?;
+            offload.setup_toolchain()?;
+            offload.run_cargo_command("run", &args, &cli.env_vars, &cli.forward_ports)?;
+            let elapsed = start_time.elapsed();
+            info!(
+                "Remote run completed successfully (took {})",
+                format_duration(elapsed)
+            );
+        }
+
         Commands::Test { args } => {
             offload.sync_source()?;
             offload.setup_toolchain()?;
-            offload.run_cargo_command("test", &args, &cli.env_vars)?;
+            offload.run_cargo_command("test", &args, &cli.env_vars, &[])?;
             let elapsed = start_time.elapsed();
             info!(
                 "Tests completed successfully (took {})",
@@ -214,7 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Clippy { args } => {
             offload.sync_source()?;
             offload.setup_toolchain()?;
-            offload.run_cargo_command("clippy", &args, &cli.env_vars)?;
+            offload.run_cargo_command("clippy", &args, &cli.env_vars, &[])?;
             let elapsed = start_time.elapsed();
             info!(
                 "Clippy completed successfully (took {})",

@@ -81,7 +81,7 @@ impl CargoOffload {
         info!("Syncing source code to remote...");
 
         // Create remote directory if it doesn't exist
-        self.run_ssh_command_silent(&format!("mkdir -p {}", self.remote_dir))?;
+        self.run_ssh_command(&format!("mkdir -p {}", self.remote_dir), false, &[])?;
 
         // Use rsync to sync source, excluding target directory and other build artifacts
         let mut rsync_cmd = Command::new("rsync");
@@ -116,10 +116,14 @@ impl CargoOffload {
         match &self.toolchain {
             Some(toolchain) => {
                 info!("Setting up toolchain {} on remote...", toolchain);
-                self.run_ssh_command_silent(&format!(
-                    "cd {} && rustup toolchain install {}",
-                    self.remote_dir, toolchain
-                ))?;
+                self.run_ssh_command(
+                    &format!(
+                        "cd {} && rustup toolchain install {}",
+                        self.remote_dir, toolchain
+                    ),
+                    false,
+                    &[],
+                )?;
             }
             None => {
                 // TODO: make sure stable matches?
@@ -140,7 +144,7 @@ impl CargoOffload {
             )
         };
 
-        self.run_ssh_command_silent(&target_install_cmd)?;
+        self.run_ssh_command(&target_install_cmd, false, &[])?;
         Ok(())
     }
 
@@ -149,6 +153,7 @@ impl CargoOffload {
         subcommand: &str,
         args: &[String],
         env_vars: &[String],
+        forward_ports: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Running cargo {} on remote...", subcommand);
 
@@ -231,7 +236,7 @@ impl CargoOffload {
             cargo_args.join(" ")
         );
 
-        self.run_ssh_command(&cargo_cmd)?;
+        self.run_ssh_command(&cargo_cmd, true, forward_ports)?;
         debug!("Cargo {} completed successfully on remote", subcommand);
 
         Ok(())
@@ -241,7 +246,7 @@ impl CargoOffload {
         debug!("Running rustup toolchain command on remote...");
 
         let toolchain_cmd = format!("rustup toolchain {}", args.join(" "));
-        self.run_ssh_command(&toolchain_cmd)?;
+        self.run_ssh_command(&toolchain_cmd, true, &[])?;
         debug!("Toolchain command completed successfully on remote");
 
         Ok(())
@@ -407,7 +412,7 @@ impl CargoOffload {
         info!("Cleaning remote build directory...");
 
         // Clean remote directory
-        self.run_ssh_command_silent(&format!("rm -rf {}", self.remote_dir))?;
+        self.run_ssh_command(&format!("rm -rf {}", self.remote_dir), false, &[])?;
 
         // Clean local offload target directory
         let local_offload_dir = "target/offload";
@@ -439,40 +444,73 @@ impl CargoOffload {
         Ok(())
     }
 
-    fn run_ssh_command(&self, command: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_ssh_command(
+        &self,
+        command: &str,
+        print_output: bool,
+        forward_ports: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut ssh_cmd = Command::new("ssh");
-        ssh_cmd
-            .arg("-p")
-            .arg(self.port.to_string())
-            .arg("-t")
-            .arg(&self.host)
-            .arg(command)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
 
-        let status = ssh_cmd.status()?;
-        if !status.success() {
-            return Err(format!("SSH command failed: {}", command).into());
+        // Force pseudo-terminal allocation for interactive programs
+        ssh_cmd.arg("-t");
+
+        if !forward_ports.is_empty() {
+            let mut ssh_forward_args = Vec::new();
+            for port_spec in forward_ports {
+                // Parse format: local_port:remote_port or just port (assumes same port on both sides)
+                let parts: Vec<&str> = port_spec.split(':').collect();
+                match parts.len() {
+                    1 => {
+                        // Same port on both sides
+                        ssh_forward_args.push("-L".to_string());
+                        ssh_forward_args.push(format!("{}:localhost:{}", parts[0], parts[0]));
+                    }
+                    2 => {
+                        // Different ports: local:remote
+                        ssh_forward_args.push("-L".to_string());
+                        ssh_forward_args.push(format!("{}:localhost:{}", parts[0], parts[1]));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Invalid port forwarding specification: {}",
+                            port_spec
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            // Disable strict host key check
+            // ssh_cmd.arg("-o").arg("StrictHostKeyChecking=no");
+
+            // Add port forwarding arguments
+            info!("Port forwarding: {}", forward_ports.join(", "));
+            for arg in ssh_forward_args {
+                ssh_cmd.arg(&arg);
+            }
         }
 
-        Ok(())
-    }
-
-    fn run_ssh_command_silent(&self, command: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let mut ssh_cmd = Command::new("ssh");
         ssh_cmd
             .arg("-p")
             .arg(self.port.to_string())
-            .arg("-t")
             .arg(&self.host)
             .arg(command);
 
-        let output = ssh_cmd.output()?;
-        let status = output.status;
-        if !status.success() {
-            io::stdout().write_all(&output.stdout)?;
-            io::stderr().write_all(&output.stderr)?;
-            return Err(format!("SSH command failed: {}", command).into());
+        if print_output {
+            ssh_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            let status = ssh_cmd.status()?;
+            if !status.success() {
+                return Err(format!("SSH command failed: {}", command).into());
+            }
+        } else {
+            let output = ssh_cmd.output()?;
+            let status = output.status;
+            if !status.success() {
+                io::stdout().write_all(&output.stdout)?;
+                io::stderr().write_all(&output.stderr)?;
+                return Err(format!("SSH command failed: {}", command).into());
+            }
         }
 
         Ok(())

@@ -5,12 +5,14 @@ A high-performance CLI tool for offloading Rust compilation to remote servers. S
 ## 🚀 Features
 
 - **Remote Compilation**: Build your Rust projects on powerful remote servers
+- **Flexible Execution**: Run binaries locally or remotely with port forwarding support
 - **Seamless Integration**: Works as a drop-in replacement for common `cargo` commands
 - **Intelligent Syncing**: Efficiently syncs only necessary source files using `rsync`
 - **Toolchain Management**: Automatically detects and sets up the correct Rust toolchain on remote servers
 - **Multi-target Support**: Build for different target architectures
 - **Workspace Support**: Full support for Rust workspaces and multi-binary projects
 - **Parallel Binary Transfer**: Efficiently copies multiple binaries in parallel
+- **SSH Port Forwarding**: Forward ports from remote to local for network services
 - **Clean Integration**: Mimics standard `cargo` command behavior
 
 ## 📋 Prerequisites
@@ -86,13 +88,41 @@ offload build --release
 offload build --bin my-binary
 ```
 
-#### Run
+#### Run (Local Execution)
 Build on remote server and run the binary locally:
 
 ```bash
 offload run
 offload run --bin my-binary
 offload run --release -- --config app.toml
+```
+
+#### Run Local (Explicit)
+Same as `run` - build remotely and execute locally:
+
+```bash
+offload run-local
+offload run-local --bin my-binary -- --verbose
+```
+
+#### Run Remote
+Execute `cargo run` directly on the remote server with optional port forwarding:
+
+```bash
+# Basic remote execution
+offload run-remote
+
+# With port forwarding (same port on both sides)
+offload --forward 8080 run-remote -- --bin web-server
+
+# With different local and remote ports
+offload --forward 3000:8080 run-remote -- --release
+
+# Multiple port forwards
+offload --forward 8080:8080 --forward 5432:5432 run-remote -- --config prod.yaml
+
+# Short flag syntax
+offload -L 8080:3000 run-remote -- --bin api-server
 ```
 
 #### Test
@@ -136,6 +166,40 @@ All commands support these global options:
 - `--target <TARGET>`: Target triple (default: x86_64-unknown-linux-gnu)
 - `--env, -e <ENV>`: Environment variables to pass to remote cargo commands (can be specified multiple times)
 - `--copy-all-artifacts`: Copy all artifacts from target directory (including deps, build, etc.)
+- `--forward, -L <PORT_SPEC>`: Forward ports from remote to local (format: `local_port:remote_port` or just `port`)
+
+### Port Forwarding
+
+The `--forward` (or `-L`) flag enables SSH port forwarding from the remote server to your local machine. This is particularly useful when running web servers, databases, or other network services remotely.
+
+#### Port Forwarding Formats
+
+```bash
+# Same port on both local and remote (8080 -> 8080)
+offload --forward 8080 run-remote
+
+# Different ports (local 3000 -> remote 8080)
+offload --forward 3000:8080 run-remote
+
+# Multiple port forwards
+offload --forward 8080:8080 --forward 5432:5432 --forward 6379:6379 run-remote
+```
+
+#### Use Cases
+
+- **Web Development**: Forward HTTP/HTTPS ports for web applications
+- **Database Development**: Forward database ports (PostgreSQL, MySQL, Redis, etc.)
+- **API Development**: Forward API server ports for local testing
+- **Microservices**: Forward multiple service ports simultaneously
+
+#### Example: Web Server Development
+
+```bash
+# Run a web server on remote port 8080, accessible locally on port 3000
+offload --forward 3000:8080 run-remote -- --bin web-server --port 8080
+
+# Now you can access the remote server at http://localhost:3000
+```
 
 ### Examples
 
@@ -149,9 +213,24 @@ offload --target aarch64-unknown-linux-gnu build
 # Run with arguments separated by --
 offload run --bin server -- --port 8080 --config production.toml
 
+# Run remotely with port forwarding for a web API
+offload --forward 8080:8080 run-remote -- --bin api-server --host 0.0.0.0
+
 # Test with specific host from environment
 CARGO_OFFLOAD_HOST=developer@ci-server.com offload test
+
+# Remote development with database and web server
+offload --forward 3000:8080 --forward 5432:5432 run-remote -- --bin full-stack-app
 ```
+
+### Command Comparison
+
+| Command | Build Location | Execution Location | Binary Transfer | Port Forwarding |
+|---------|----------------|-------------------|-----------------|-----------------|
+| `build` | Remote | N/A | Yes | No |
+| `run` | Remote | Local | Yes | No |
+| `run-local` | Remote | Local | Yes | No |
+| `run-remote` | Remote | Remote | No | Yes (optional) |
 
 ### Artifact Copying
 
@@ -195,6 +274,9 @@ offload -e CARGO_TERM_COLOR=always run -- --verbose
 
 # Multiple environment variables with complex values
 offload -e CC=gcc-13 -e CFLAGS="-O3 -march=native" -e RUSTFLAGS="-C target-feature=+avx2" build
+
+# Environment variables with remote execution and port forwarding
+offload -e RUST_LOG=debug --forward 8080 run-remote -- --bin web-server
 ```
 
 These environment variables are only applied to the cargo command on the remote machine and don't affect your local environment. Values containing spaces, quotes, or special characters are properly escaped to ensure they work correctly on the remote system.
@@ -220,15 +302,24 @@ You can specify a toolchain using the `+toolchain` syntax:
 ```bash
 offload +nightly build
 offload +1.70.0 test
+offload +nightly run-remote -- --bin experimental-feature
 ```
 
 ## 🏗️ How It Works
 
+### Local Execution (`run`, `run-local`)
 1. **Source Sync**: Uses `rsync` to efficiently sync your source code to `/tmp/offload/[project-name]` on the remote server
 2. **Toolchain Setup**: Installs and configures the required Rust toolchain on the remote server
 3. **Remote Build**: Executes the cargo command on the remote server with proper target configuration
 4. **Binary Transfer**: Copies compiled binaries back to `target/offload/[target]/[profile]/` in your local project
-5. **Local Execution**: For `run` commands, executes the binary locally with provided arguments
+5. **Local Execution**: Executes the binary locally with provided arguments
+
+### Remote Execution (`run-remote`)
+1. **Source Sync**: Uses `rsync` to efficiently sync your source code to the remote server
+2. **Toolchain Setup**: Installs and configures the required Rust toolchain on the remote server
+3. **Remote Execution**: Executes `cargo run` directly on the remote server with SSH port forwarding
+4. **Port Forwarding**: Maintains SSH tunnel for specified ports throughout execution
+5. **Interactive Support**: Provides full terminal interaction with the remote process
 
 ## 📁 Directory Structure
 
@@ -279,6 +370,11 @@ Remote directory structure:
    - Sufficient RAM (4GB+ for large projects)
    - Fast storage (SSD preferred)
 
+4. **Choose Execution Mode Wisely**:
+   - Use `run-local` for CPU-intensive applications that don't need network services
+   - Use `run-remote` with port forwarding for web applications, APIs, and network services
+   - Use `run-remote` without port forwarding for CLI tools and batch processing
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -290,6 +386,18 @@ ssh user@remote-server.com
 
 # Check SSH key authentication
 ssh -v user@remote-server.com
+```
+
+**Port Forwarding Issues**
+```bash
+# Check if port is already in use locally
+netstat -an | grep LISTEN | grep :8080
+
+# Test port forwarding manually
+ssh -L 8080:localhost:8080 user@remote-server.com
+
+# Use different local port if there's a conflict
+offload --forward 3000:8080 run-remote
 ```
 
 **Rsync Permission Errors**
@@ -314,6 +422,7 @@ Enable debug logging for troubleshooting:
 
 ```bash
 RUST_LOG=debug offload build
+RUST_LOG=debug offload --forward 8080 run-remote
 ```
 
 ## 🤝 Contributing
