@@ -53,6 +53,12 @@ pub enum Commands {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    #[command(name = "run-local")]
+    RunLocal {
+        /// Arguments to pass to cargo build
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Run tests on remote
     Test {
@@ -113,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Commands::Run { args } => {
+        Commands::Run { args } | Commands::RunLocal { args } => {
             let (build_args, run_args) = separate_run_args_from_raw(&args);
 
             // manually parse args
