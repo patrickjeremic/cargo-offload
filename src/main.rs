@@ -109,7 +109,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (toolchain, filtered_args) = parse_cargo_style_args(raw_args.clone());
 
     // Re-parse with filtered args (without the +toolchain part)
-    let cli = Cli::try_parse_from(filtered_args)?;
+    let cli = match Cli::try_parse_from(filtered_args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Print the error with proper formatting
+            err.print().expect("Error writing Error");
+            std::process::exit(err.exit_code());
+        }
+    };
 
     // Verify we're in a Rust project
     if !Path::new("Cargo.toml").exists() {
