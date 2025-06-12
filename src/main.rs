@@ -97,8 +97,81 @@ pub enum Commands {
     Clean,
 }
 
+fn check_prerequisites() -> Result<String, Box<dyn std::error::Error>> {
+    // Check if rsync is installed and determine progress flag support
+    let progress_flag = match std::process::Command::new("rsync")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            debug!("rsync is available");
+
+            // Check if rsync supports --info=progress2 by testing the flag directly
+            // We use a minimal dry-run command to test the flag without actually transferring files
+            match std::process::Command::new("rsync")
+                .arg("--info=progress2")
+                .arg("--dry-run")
+                .arg("--quiet")
+                .arg("/dev/null")
+                .arg("/tmp/")
+                .output()
+            {
+                Ok(test_output) if test_output.status.success() => {
+                    debug!("rsync supports --info=progress2");
+                    "--info=progress2"
+                }
+                Ok(test_output) => {
+                    debug!(
+                        "rsync does not support --info=progress2 (exit code: {:?}), falling back to --progress",
+                        test_output.status.code()
+                    );
+                    "--progress"
+                }
+                Err(e) => {
+                    debug!(
+                        "Could not test rsync --info=progress2 support ({}), falling back to --progress",
+                        e
+                    );
+                    "--progress"
+                }
+            }
+        }
+        Ok(_) => {
+            eprintln!("Error: rsync is installed but not working properly.");
+            eprintln!();
+            eprintln!("Please ensure rsync is properly installed and accessible in your PATH.");
+            return Err("rsync check failed".into());
+        }
+        Err(_) => {
+            eprintln!("Error: rsync is not installed or not found in PATH.");
+            eprintln!();
+            eprintln!("rsync is required for cargo-offload to sync files to the remote server.");
+            return Err("rsync not found".into());
+        }
+    };
+
+    // Check if ssh is installed
+    match std::process::Command::new("ssh").arg("-V").output() {
+        Ok(output) if output.status.success() => {
+            debug!("ssh is available");
+        }
+        Ok(_) => {
+            eprintln!("Warning: ssh is installed but may not be working properly.");
+        }
+        Err(_) => {
+            eprintln!("Warning: ssh is not installed or not found in PATH.");
+            eprintln!("SSH is required for connecting to the remote server.");
+        }
+    }
+
+    Ok(progress_flag.to_string())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("warn"));
+
+    // Perform preflight checks and get the appropriate progress flag
+    let progress_flag = check_prerequisites()?;
 
     let start_time = Instant::now();
 
@@ -123,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Not in a Rust project directory (Cargo.toml not found)".into());
     }
 
-    let offload = CargoOffload::new(&cli, toolchain)?;
+    let offload = CargoOffload::new(&cli, toolchain, progress_flag)?;
 
     match cli.command {
         Commands::Build { args } => {

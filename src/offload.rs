@@ -7,8 +7,6 @@ use std::{fs, io};
 use crate::util::*;
 use crate::Cli;
 
-const PROGRESS_FLAG: &str = "--info=progress2";
-
 pub struct CargoOffload {
     host: String,
     port: u16,
@@ -16,10 +14,15 @@ pub struct CargoOffload {
     toolchain: Option<String>,
     target: String,
     copy_all_artifacts: bool,
+    progress_flag: String,
 }
 
 impl CargoOffload {
-    pub fn new(cli: &Cli, toolchain: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        cli: &Cli,
+        toolchain: Option<String>,
+        progress_flag: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Parse host and port from environment variable or CLI args
         let (host, port) = Self::parse_host_and_port(cli)?;
         info!("Executing command on {}:{}", host, port);
@@ -51,6 +54,7 @@ impl CargoOffload {
             toolchain: final_toolchain,
             target,
             copy_all_artifacts: cli.copy_all_artifacts,
+            progress_flag,
         })
     }
 
@@ -91,7 +95,7 @@ impl CargoOffload {
             .arg("--compress")
             .arg("-e")
             .arg(format!("ssh -p {}", self.port))
-            .arg(PROGRESS_FLAG)
+            .arg(&self.progress_flag)
             .arg("--exclude=target/")
             .arg("--exclude=.git/")
             .arg("--exclude=*.swp")
@@ -278,7 +282,7 @@ impl CargoOffload {
             .arg("--compress")
             .arg("-e")
             .arg(format!("ssh -p {}", self.port))
-            .arg(PROGRESS_FLAG)
+            .arg(&self.progress_flag)
             .arg("--exclude=.cargo-lock")
             .arg("--exclude=*.d"); // TODO: can we improve this by not excluding?
 
