@@ -45,8 +45,8 @@ impl CargoOffload {
 
         // Use provided toolchain, detect it from `cargo --version` or use toolchain files
         let final_toolchain = toolchain
-            .or_else(|| detect_toolchain_from_cargo().unwrap_or(None))
-            .or_else(|| detect_toolchain_from_files().unwrap_or(None));
+            .or_else(|| detect_toolchain_from_files().unwrap_or(None))
+            .or_else(|| detect_toolchain_from_cargo().unwrap_or(None));
 
         Ok(CargoOffload {
             host,
